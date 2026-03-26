@@ -1,10 +1,10 @@
 <div align="center">
 
-<img src="./docs/intellikit.svg" alt="IntelliKit" width="200" />
+<img src="./docs/public/intellikit.svg" alt="IntelliKit" width="200" />
 
 # IntelliKit
 
-**Profiling and analysis for AMD software — GPU, host CPU, and LLM workflows**
+**Agent-first tooling for AMD hardware**
 
 </div>
 
