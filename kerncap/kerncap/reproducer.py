@@ -4,6 +4,7 @@ Takes captured kernel data and located source, generates a self-contained
 project that uses kerncap-replay for VA-faithful kernel replay.
 """
 
+import ast
 import hashlib
 import json
 import logging
@@ -267,6 +268,172 @@ def _write_replay_makefile(
         f.write("\n".join(lines) + "\n")
 
 
+_TRITON_SAFE_IMPORT_ROOTS = frozenset(
+    {
+        "triton",
+        "math",
+        "functools",
+        "os",
+        "sys",
+        "typing",
+        "dataclasses",
+        "enum",
+        "itertools",
+        "operator",
+        "abc",
+        "collections",
+        "builtins",
+    }
+)
+
+
+def _extract_triton_kernel_standalone(
+    source_file: str,
+    kernel_function: str,
+    output_path: str,
+) -> None:
+    """Extract a minimal standalone Triton kernel module from a source file.
+
+    Parses *source_file*, collects every ``@triton.jit`` / ``@triton.autotune``
+    decorated function plus only the triton/stdlib imports, and writes a new
+    ``output_path`` that can be imported without pulling in any heavy
+    framework code (e.g. vLLM custom-op registrations).
+
+    Parameters
+    ----------
+    source_file : str
+        Path to the Python file that contains the target kernel.
+    kernel_function : str
+        Name (or substring) of the kernel function to extract.
+    output_path : str
+        Destination file path for the generated standalone module.
+    """
+    with open(source_file, "r") as f:
+        source = f.read()
+    source_lines = source.splitlines()
+
+    tree = ast.parse(source, filename=source_file)
+
+    # ------------------------------------------------------------------ #
+    # Collect all @triton.jit / @triton.autotune decorated functions.      #
+    # We include all of them because helper kernels called by the target   #
+    # are typically also decorated, and the set is usually small.          #
+    # ------------------------------------------------------------------ #
+    triton_decorator_names = {"triton.jit", "jit", "triton.autotune", "autotune"}
+
+    def _decorator_name(node: ast.expr) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parts: List[str] = []
+            cur: ast.expr = node
+            while isinstance(cur, ast.Attribute):
+                parts.append(cur.attr)
+                cur = cur.value
+            if isinstance(cur, ast.Name):
+                parts.append(cur.id)
+            return ".".join(reversed(parts))
+        if isinstance(node, ast.Call):
+            return _decorator_name(node.func)
+        return ""
+
+    def _node_source_with_decorators(func_node: ast.FunctionDef) -> str:
+        """Return the full source text for *func_node* including decorators."""
+        if func_node.decorator_list:
+            start = func_node.decorator_list[0].lineno - 1
+        else:
+            start = func_node.lineno - 1
+        end = func_node.end_lineno  # 1-indexed inclusive; works as 0-indexed exclusive slice bound
+        return "\n".join(source_lines[start:end])
+
+    triton_funcs: List[ast.FunctionDef] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for dec in node.decorator_list:
+            if _decorator_name(dec) in triton_decorator_names:
+                triton_funcs.append(node)
+                break
+
+    if not any(f.name == kernel_function for f in triton_funcs):
+        found = [f.name for f in triton_funcs]
+        raise ValueError(
+            f"Kernel function '{kernel_function}' not found among Triton-decorated "
+            f"functions in {source_file}. Found: {found}"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Collect safe (triton / stdlib) imports from the entire AST.          #
+    # ast.walk finds imports inside try/except, if-guards, etc. that a     #
+    # top-level-only scan would miss (e.g. vLLM wraps triton imports in    #
+    # try/except blocks).                                                  #
+    # ------------------------------------------------------------------ #
+    import_lines: List[str] = []
+    seen_imports: set = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            safe_aliases = [
+                alias
+                for alias in node.names
+                if alias.name.split(".")[0] in _TRITON_SAFE_IMPORT_ROOTS
+            ]
+            if not safe_aliases:
+                continue
+            for alias in safe_aliases:
+                seg = f"import {alias.name}"
+                if alias.asname:
+                    seg += f" as {alias.asname}"
+                if seg not in seen_imports:
+                    seen_imports.add(seg)
+                    import_lines.append(seg)
+            continue
+        elif isinstance(node, ast.ImportFrom):
+            if node.level and node.level > 0:
+                continue  # skip relative imports
+            root = (node.module or "").split(".")[0]
+            if root not in _TRITON_SAFE_IMPORT_ROOTS:
+                continue
+        else:
+            continue
+
+        seg = ast.get_source_segment(source, node)
+        if seg is None:
+            seg = ast.unparse(node)
+        if seg and seg not in seen_imports:
+            seen_imports.add(seg)
+            import_lines.append(seg)
+
+    # Every standalone Triton kernel file needs these unconditionally.
+    if "import triton" not in seen_imports:
+        import_lines.insert(0, "import triton")
+    if not any("triton.language" in s for s in seen_imports):
+        import_lines.insert(1, "import triton.language as tl")
+
+    # ------------------------------------------------------------------ #
+    # Build and write the standalone file.                                 #
+    # ------------------------------------------------------------------ #
+    parts: List[str] = [
+        "# Standalone Triton kernel module — generated by kerncap.",
+        "# Contains only the captured kernel and its direct Triton helpers.",
+        "",
+        *import_lines,
+        "",
+    ]
+    for func_node in triton_funcs:
+        parts.append(_node_source_with_decorators(func_node))
+        parts.append("")
+
+    with open(output_path, "w") as f:
+        f.write("\n".join(parts) + "\n")
+
+    logger.debug(
+        "Wrote standalone kernel module: %s (%d triton function(s))",
+        output_path,
+        len(triton_funcs),
+    )
+
+
 def generate_triton_reproducer(
     capture_dir: str,
     kernel_source: KernelSource,
@@ -307,15 +474,23 @@ def generate_triton_reproducer(
     main_dir = os.path.dirname(main_file)
 
     # If the kernel lives inside a Python package (directory has __init__.py),
-    # copy the entire package directory so relative imports keep working.
+    # extract a minimal standalone Triton module instead of copying the whole
+    # package.  Copying the entire package risks pulling in module-level side
+    # effects (e.g. vLLM custom-op registrations via direct_register_custom_op)
+    # that collide with the already-registered ops from the editable install.
     pkg_init = os.path.join(main_dir, "__init__.py")
     if os.path.isfile(pkg_init):
-        pkg_name = os.path.basename(main_dir)
-        pkg_dest = os.path.join(output_dir, pkg_name)
-        if os.path.exists(pkg_dest):
-            shutil.rmtree(pkg_dest)
-        shutil.copytree(main_dir, pkg_dest)
-        kernel_module = f"{pkg_name}.{Path(main_file).stem}"
+        variant_path = os.path.join(output_dir, "kernel_variant.py")
+        _extract_triton_kernel_standalone(
+            main_file,
+            kernel_source.kernel_function,
+            variant_path,
+        )
+        kernel_module = "kernel_variant"
+        logger.info(
+            "Extracted standalone kernel module: %s (avoided full package copy)",
+            variant_path,
+        )
     else:
         # No package structure: copy individual files to flat directory.
         # Unlike the HIP path, Triton files use Python module imports

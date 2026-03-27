@@ -154,14 +154,57 @@ _CAPTURE_HOOK = textwrap.dedent('''\
         return grid + (1,) * max(0, 3 - len(grid))
 
 
+    def _save_tensor_storage(tensor, filepath):
+        """Save a tensor's full underlying storage to preserve stride layout.
+
+        Unlike _save_tensor, this does NOT call .contiguous(), so non-standard
+        strides (e.g. padded row layouts) are preserved in the on-disk bytes.
+
+        We view the GPU storage as a flat uint8 tensor and copy THAT to CPU,
+        rather than calling tensor.cpu() which creates a contiguous copy and
+        discards the padded layout.  The caller must record tensor.stride()
+        and tensor.storage_offset() in metadata so the reproducer can
+        reconstruct the original view via torch.as_strided.
+        """
+        import torch
+        storage = tensor.detach().untyped_storage()
+        flat_gpu = torch.empty(storage.nbytes(), dtype=torch.uint8,
+                               device=tensor.device)
+        flat_gpu.set_(storage)
+        flat_cpu = flat_gpu.cpu()
+        flat_cpu.numpy().tofile(filepath)
+
     def _save_tensor(tensor, filepath):
-        """Save a tensor to a raw binary file."""
+        """Save a tensor's logical values as a contiguous binary file.
+
+        Used for reference outputs where we compare logical values, not layouts.
+        """
         import torch
         cpu_tensor = tensor.detach().cpu().contiguous()
         if cpu_tensor.dtype == torch.bfloat16:
             cpu_tensor.view(torch.uint16).numpy().tofile(filepath)
         else:
             cpu_tensor.numpy().tofile(filepath)
+
+
+    def _is_triton_dtype(val):
+        """Return True if *val* is a triton.language dtype (e.g. tl.bfloat16)."""
+        try:
+            import triton.language as _tl
+            return isinstance(val, _tl.dtype)
+        except (ImportError, AttributeError):
+            return False
+
+    def _triton_dtype_attr(val):
+        """Return the tl attribute name for a triton dtype object.
+
+        E.g. tl.bfloat16 -> "bfloat16", tl.float16 -> "float16".
+        """
+        import triton.language as _tl
+        for attr in dir(_tl):
+            if getattr(_tl, attr, None) is val:
+                return attr
+        return str(val)
 
 
     def _save_capture(jit_fn, args, kwargs, grid, autotuner_config_keys):
@@ -204,7 +247,7 @@ _CAPTURE_HOOK = textwrap.dedent('''\
             if isinstance(val, torch.Tensor):
                 filename = f"arg_{i}.bin"
                 filepath = os.path.join(_output_dir, filename)
-                _save_tensor(val, filepath)
+                _save_tensor_storage(val, filepath)
 
                 metadata["args"].append({
                     "index": i,
@@ -216,6 +259,8 @@ _CAPTURE_HOOK = textwrap.dedent('''\
                     "ref_output_file": f"ref_output_{i}.bin",
                     "buffer_size": val.nelement() * val.element_size(),
                     "shape": list(val.shape),
+                    "strides": list(val.stride()),
+                    "storage_offset": val.storage_offset(),
                     "torch_dtype": str(val.dtype),
                 })
                 tensor_args.append((i, name, val))
@@ -240,6 +285,17 @@ _CAPTURE_HOOK = textwrap.dedent('''\
                     "is_autotune_config": is_config,
                     "value": val,
                     "type": type(val).__name__,
+                })
+
+            elif _is_triton_dtype(val):
+                metadata["args"].append({
+                    "index": i,
+                    "name": name,
+                    "is_pointer": False,
+                    "is_const": True,
+                    "is_autotune_config": is_config,
+                    "value": _triton_dtype_attr(val),
+                    "type": "triton_dtype",
                 })
 
             else:
@@ -401,11 +457,14 @@ def run_triton_capture(
 
         meta_file = os.path.join(output_dir, "metadata.json")
         if not os.path.exists(meta_file):
+            tail = 2000
+            stdout_tail = proc.stdout[-tail:] if proc.stdout else ""
+            stderr_tail = proc.stderr[-tail:] if proc.stderr else ""
             raise RuntimeError(
                 f"Triton capture did not produce metadata.json in "
                 f"{output_dir}.\n"
-                f"stdout: {proc.stdout[:500]}\n"
-                f"stderr: {proc.stderr[:500]}"
+                f"stdout (last {tail} chars): {stdout_tail}\n"
+                f"stderr (last {tail} chars): {stderr_tail}"
             )
 
         return output_dir
