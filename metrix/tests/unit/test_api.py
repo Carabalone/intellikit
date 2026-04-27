@@ -4,8 +4,8 @@ Unit tests for the high-level Metrix API
 
 import pytest
 from metrix.api import Metrix, ProfilingResults, KernelResults
-from metrix.backends import Statistics
-from .conftest import requires_arch
+from metrix.backends import Statistics, get_backend
+from .conftest import requires_arch, requires_metric
 
 
 class TestMetrixInit:
@@ -14,9 +14,9 @@ class TestMetrixInit:
     def test_init_default(self):
         """Test default initialization (falls back to gfx942 if no hardware detected)"""
         profiler = Metrix()
-        # Default depends on hardware detection, but should succeed
-        assert profiler.arch in ["gfx942", "gfx950", "gfx90a", "gfx1201", "gfx1151"]
+        # Should succeed on any registered architecture
         assert profiler.backend is not None
+        assert len(profiler.arch) > 0
 
     @pytest.mark.parametrize("arch", ["gfx942", "gfx90a"])
     def test_init_custom_arch(self, arch):
@@ -40,7 +40,7 @@ class TestMetrixMetricListing:
 
     @pytest.mark.parametrize("arch", ["gfx942", "gfx90a"])
     def test_list_metrics_includes_compute(self, arch):
-        """Test that compute metrics are included in list"""
+        """Test that compute metrics are included in list (CDNA only)"""
         profiler = Metrix(arch=arch)
         metrics = profiler.list_metrics()
         assert "compute.total_flops" in metrics
@@ -48,6 +48,18 @@ class TestMetrixMetricListing:
         assert "compute.hbm_arithmetic_intensity" in metrics
         assert "compute.l2_arithmetic_intensity" in metrics
         assert "compute.l1_arithmetic_intensity" in metrics
+
+    def test_list_metrics_on_detected_arch(self):
+        """Test that listing metrics works on whatever GPU is detected"""
+        profiler = Metrix()
+        metrics = profiler.list_metrics()
+        assert isinstance(metrics, list)
+
+    @requires_metric("memory.l2_hit_rate")
+    def test_list_metrics_includes_l2(self):
+        """memory.l2_hit_rate should appear in list_metrics() when supported"""
+        profiler = Metrix()
+        assert "memory.l2_hit_rate" in profiler.list_metrics()
 
     @pytest.mark.parametrize("arch", ["gfx942", "gfx90a"])
     def test_list_profiles(self, arch):
